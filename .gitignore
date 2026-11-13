@@ -19,6 +19,8 @@ credentials*.json
 accounts.json
 accounts.local.json
 wb_accounts*.json
+# 短信登录的待验证状态（只含别名与手机号，仍按凭据同级保护）
+.sms-state.json
 *.pem
 *.key
 *.p12

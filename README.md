@@ -13,26 +13,36 @@
 > - 本地校验（离线、不联网、不回显令牌）：`python3 scripts/multi_checkin.py --accounts-file accounts.json --validate`
 > - 写入 Secret（令牌经 stdin 传给 gh，不进命令行）：`python3 scripts/set_accounts_secret.py accounts.json --repo <owner>/<repo>`
 > - 首次部署在 Actions 页手动 **Run workflow** 并勾选 `check_only`，确认全账号 `status: ok` 再等定时。
-> - `accounts.json` 已在 `.gitignore` 中排除，**切勿提交**；长效令牌约 60 天需重新导出更新 Secret。
+> - `accounts.json` 已在 `.gitignore` 中排除，**切勿提交**；令牌到期后重跑下面的短信登录更新 Secret。
 > - 单账号用法仍保留：直接运行 `python3 scripts/workbuddy_checkin.py`。
 >
 > ### 配置多账号（macOS 5.6.2+ 必读）
 >
 > 客户端 5.6.2 起登录态是 AES-256-GCM 信封，解密密钥只在客户端进程内存里，
-> **本机脚本无法自动导出明文长效令牌**；且 N 个账号必须各自登录一次。
-> 因此采用「浏览器取令牌 → 剪贴板 → 脚本入库」的方式，令牌全程不进命令行、日志或对话：
+> **本机脚本无法解密导出明文长效令牌**。因此改用官方插件**短信登录接口**：
+> 手机号 + 验证码由服务端直接下发明文 `accessToken` / `refreshToken`，
+> 与本机登录态、是否安装客户端无关，Linux runner 上也能用。
 >
-> 1. 浏览器登录 `https://www.workbuddy.cn`，在该账号页面运行
->    `templates/export-refresh-token.js`（Console 粘贴或存成书签），令牌进剪贴板。
->    若提示未找到，用 DevTools → Network → `token/refresh` 响应的 `refreshToken` 字段。
-> 2. 换下一个账号重复第 1 步。
-> 3. 每个账号各跑一次：`python3 scripts/add_account.py --alias main`
->    （默认从剪贴板读，校验形态后以 0600 原子写入 `accounts.json`，随后清空剪贴板）。
-> 4. `python3 scripts/add_account.py --list` 只看别名与脱敏指纹；
->    `--remove <别名>` 删号；`--source file --file <路径>` 可改用文件输入。
+> 每个账号约 30 秒，需收一次短信（验证码有效期约 300 秒）：
 >
-> 脚本会拒绝网页授权码（`WBAUTH1:`）、加密信封（`$wbEncrypted`）和短效令牌——
-> 这三类填进 Secret 必然 401。
+> 1. `python3 scripts/sms_login.py --alias account01`
+>    交互提示输手机号 → 收短信 → 输验证码；脚本把 RT 以 0600 写入 `accounts.json`。
+> 2. 换下一个账号：`--alias account02`、`account03`……重复第 1 步。
+> 3. `python3 scripts/add_account.py --list` 只看别名与脱敏指纹。
+> 4. `python3 scripts/sms_login.py --alias account01 --check`
+>    用真实 RT 连刷两次，实证「轮换后旧值是否仍可用」（不签到、不改配置）。
+> 5. `python3 scripts/multi_checkin.py --accounts-file accounts.json --validate` 校验配置，
+>    再由 `scripts/set_accounts_secret.py` 写入 `WB_ACCOUNTS_JSON`。
+>
+> **令牌绝不出现在 stdout / 命令行 / 日志 / 对话**：脚本只回报别名、脱敏手机号、
+> 脱敏指纹，服务端返回文本统一过长串脱敏闸门。state 文件 0600，只存别名与手机号。
+>
+> 也可拆成两步交给助手代跑：
+> `sms_login.py --alias account01 --phone <手机号> --send-only` →
+> `sms_login.py --alias account01 --code <验证码>`。
+>
+> 注意：短信登录可能使该账号其他端会话失效，桌面客户端或许要重登一次；
+> 长效令牌约 30–60 天到期（以令牌自身 `exp` 为准），到期后重跑本流程即可。
 >
 > 其余说明（接口原理、5.6.2+ 加密登录态、脱敏、通知配置）下文依然有效。
 
