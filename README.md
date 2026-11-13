@@ -1,378 +1,347 @@
-# WorkBuddy 每日自动签到 · GitHub Actions 版
+# WorkBuddy 每日自动签到 · 多账号版（GitHub Actions）
 
-> ## 本副本已改造为「多账号版」（2026-11-13）
+> **这份文档只描述本 fork 当前实际在跑的多账号版。** 上游 `tslshuli/workbuddy-checkin-public` 的单账号文档（`WB_REFRESH_TOKEN` / `WB_ACCESS_TOKEN` / `sync_token_to_github.py`）在本仓库**已不适用**，照抄会 guard 失败。
 >
-> **下文是上游单账号版文档，其中 `WB_REFRESH_TOKEN` / `WB_ACCESS_TOKEN` 两个 Secret
-> 在本副本的 workflow 中不再生效**，照抄会 guard 失败。本副本只认一个 Secret：
->
-> | Secret | 内容 |
-> |---|---|
-> | `WB_ACCOUNTS_JSON` | 账号数组 `[{"name":"main","refresh_token":"<长效令牌>"}, ...]`，格式见 `accounts.example.json` |
->
-> - 入口：`scripts/multi_checkin.py` → 逐账号起独立子进程调用原签到脚本，单账号失败不影响其余。
-> - 本地校验（离线、不联网、不回显令牌）：`python3 scripts/multi_checkin.py --accounts-file accounts.json --validate`
-> - 写入 Secret（令牌经 stdin 传给 gh，不进命令行）：`python3 scripts/set_accounts_secret.py accounts.json --repo <owner>/<repo>`
-> - 首次部署在 Actions 页手动 **Run workflow** 并勾选 `check_only`，确认全账号 `status: ok` 再等定时。
-> - `accounts.json` 已在 `.gitignore` 中排除，**切勿提交**；令牌到期后重跑下面的短信登录更新 Secret。
-> - 单账号用法仍保留：直接运行 `python3 scripts/workbuddy_checkin.py`。
->
-> ### 配置多账号（macOS 5.6.2+ 必读）
->
-> 客户端 5.6.2 起登录态是 AES-256-GCM 信封，解密密钥只在客户端进程内存里，
-> **本机脚本无法解密导出明文长效令牌**。因此改用官方插件**短信登录接口**：
-> 手机号 + 验证码由服务端直接下发明文 `accessToken` / `refreshToken`，
-> 与本机登录态、是否安装客户端无关，Linux runner 上也能用。
->
-> 每个账号约 30 秒，需收一次短信（验证码有效期约 300 秒）：
->
-> 1. `python3 scripts/sms_login.py --alias account01`
->    交互提示输手机号 → 收短信 → 输验证码；脚本把 RT 以 0600 写入 `accounts.json`。
-> 2. 换下一个账号：`--alias account02`、`account03`……重复第 1 步。
-> 3. `python3 scripts/add_account.py --list` 只看别名与脱敏指纹。
-> 4. `python3 scripts/sms_login.py --alias account01 --check`
->    用真实 RT 连刷两次，实证「轮换后旧值是否仍可用」（不签到、不改配置）。
-> 5. `python3 scripts/multi_checkin.py --accounts-file accounts.json --validate` 校验配置，
->    再由 `scripts/set_accounts_secret.py` 写入 `WB_ACCOUNTS_JSON`。
->
-> **令牌绝不出现在 stdout / 命令行 / 日志 / 对话**：脚本只回报别名、脱敏手机号、
-> 脱敏指纹，服务端返回文本统一过长串脱敏闸门。state 文件 0600，只存别名与手机号。
->
-> 也可拆成两步交给助手代跑：
-> `sms_login.py --alias account01 --phone <手机号> --send-only` →
-> `sms_login.py --alias account01 --code <验证码>`。
->
-> 注意：短信登录可能使该账号其他端会话失效，桌面客户端或许要重登一次；
-> 长效令牌约 30–60 天到期（以令牌自身 `exp` 为准），到期后重跑本流程即可。
->
-> 其余说明（接口原理、5.6.2+ 加密登录态、脱敏、通知配置）下文依然有效。
+> 改造基线：上游 `c05a581` → 本 fork `7438fbe`（2026-11-13）。原项目 MIT，LICENSE 保留。
 
-
-用 GitHub Actions 定时完成 WorkBuddy「Buddy 加油站」每日签到。**接口直签，无需常驻本机、无需开机、无需 GUI**。
-
-> 安全说明：本仓库的代码（脚本 / workflow）**不含任何凭据**，可放心 Fork 与使用。登录凭据仅保存在你自己的 GitHub Secrets 中，绝不会出现在代码里。
+**一句话**：每个账号用手机号收一次短信验证码，换到明文长效令牌（RT）；所有 RT 组装进一个 Secret `WB_ACCOUNTS_JSON`；GitHub Actions 每天北京时间 09:00 在云端逐账号签到。**Mac 不用开机、不用装客户端、不用常驻**。只有「加账号」和「令牌到期续期」需要本机跑一次命令。
 
 ---
 
-## ⭐ 版本对照：你的客户端决定用哪种签到方式
+## 0. 平时只用这几条命令（速查）
 
-WorkBuddy 客户端从 **5.6.2** 起对登录态做了静态加密（AtRestEncryption）。
-这直接改变了「Secret 里该填什么」——**这是本项目最重要的一张表**：
+全部在仓库根目录执行：`cd ~/Codes/workbuddy-checkin-nobody`
 
-| 项目 | 客户端 **5.5.x 及更早**（未加密） | 客户端 **5.6.2+**（登录态加密） |
+| 我想做什么 | 命令 | 说明 |
 |---|---|---|
-| 登录态里 `auth.accessToken` 的形态 | 明文（JWT 字符串） | **AES-256-GCM 信封**：`{"$wbEncrypted":1,"envelope":"<base64>"}` |
-| 本机能否直接读到明文 | ✅ 能 | ❌ **不能** —— 解密密钥不落盘，只在客户端进程内存里 |
-| **该配哪个 Secret** | `WB_ACCESS_TOKEN`（短效令牌直通） | **`WB_REFRESH_TOKEN`（长效令牌，强烈推荐）** |
-| 凭据有效期 | 约 2 个月 | 长效令牌约 **60 天**；轮换后旧值不会立即失效 |
-| 配置命令 | `python scripts/sync_token_to_github.py` | 同上（脚本会自动导出**长效令牌**） |
-| 旧版做法是否还能用 | ✅ | ❌ **把 accessToken 原样塞进 Secret 必然鉴权失败** |
+| **加一个账号** | `python3 scripts/sms_login.py --alias account02` | 输手机号 → 收短信 → 输验证码；RT 自动写进 `accounts.json`（0600） |
+| **让新账号生效**（加完号必做） | `python3 scripts/set_accounts_secret.py accounts.json --repo lxuanzheng/workbuddy-checkin-nobody` | 覆盖 Secret `WB_ACCOUNTS_JSON`，幂等，几秒钟 |
+| **看看有哪些账号** | `python3 scripts/add_account.py --list --accounts accounts.json` | 只显示别名 + 脱敏指纹 |
+| **离线校验配置** | `python3 scripts/multi_checkin.py --accounts-file accounts.json --validate` | 不联网、不签到、不回显令牌 |
+| **手动验收（只读）** | Actions 页 **Run workflow** → 勾 `check_only` | 只查状态不领积分 |
+| **手动跑一次正式签到** | Actions 页 **Run workflow** → 不勾 | 当日已签会自动跳过，不会重复领 |
+| **删一个账号** | `python3 scripts/add_account.py --remove account02 --accounts accounts.json` | 删完记得重跑上面的写 Secret |
+| **令牌到期（约 30 天）** | 重跑该账号的 `sms_login.py --alias 同名` → 再覆盖 Secret | 同名会覆盖旧 RT，不重复追加 |
 
-> ⚠️ **最容易踩的坑**：在 5.6.2+ 上直接把登录态文件里的 `auth.accessToken` 复制出来填进 Secret。
-> 你复制到的其实是一坨 JSON 信封，云端 runner **拿不到解密密钥**，只会一路鉴权失败。
-> 本项目的脚本已能自动识别这种情形并**明确报错**，而不是静默失败。
-
-**不知道自己属于哪一档？** 跑一次自检即可，它会直接告诉你要配哪个 Secret：
-
-```bash
-python scripts/workbuddy_checkin.py --diagnose
-```
-
-输出里的 `credential.mode` 会写明当前走的是哪条通道。
+> ⚠️ **只加账号、不覆盖 Secret = 白加**。Actions 读的是仓库里的 Secret，不是本机的 `accounts.json`。这是最容易忘的一步。
 
 ---
 
-## 签到链路（v2.1.0-ci）
+## 1. 这套东西怎么跑
 
 ```
-                        ┌─────────────────────────────────────────────┐
-  Secret 中的凭据 ──────►│  ① WB_REFRESH_TOKEN（长效令牌，5.6.2+ 推荐） │
-                        └──────────────────┬──────────────────────────┘
-                                           │ POST /v2/plugin/auth/token/refresh
-                                           │ （端点不校验 User-Agent，适合服务端场景）
-                                           ▼
-                                     accessToken（短效接口令牌）
-                                           │
-   本机登录态文件（仅明文时）───────────────┤
-   ② WB_ACCESS_TOKEN（兼容 5.5.x）─────────┤
-                                           ▼
-                ┌──────────────────────────────────────────────────┐
-                │ 查询状态  POST {base}/v2/billing/meter/           │
-                │              checkin-activity-status              │
-                │ 若未签到  POST {base}/v2/billing/meter/           │
-                │              daily-checkin                        │
-                └──────────────────────────────────────────────────┘
+本机（只在加号/续期时）
+  手机号 + 短信验证码
+      │  POST /v2/plugin/login/send-sms
+      │  POST /v2/plugin/login/token  → 服务端直接下发明文 accessToken / refreshToken
+      ▼
+  scripts/sms_login.py  →  accounts.json（本机 0600，已 gitignore，绝不入库）
+      │
+      │  scripts/set_accounts_secret.py（令牌经 stdin 交给 gh，不进命令行）
+      ▼
+GitHub Secret: WB_ACCOUNTS_JSON   ← 唯一必填 Secret
+      │
+      │  cron '0 1 * * *'（UTC）= 北京时间 09:00；也可手动 workflow_dispatch
+      ▼
+云端 ubuntu-latest runner
+  multi_checkin.py --validate        先离线校验配置
+  multi_checkin.py --out result.json 逐账号起独立子进程 → workbuddy_checkin.py
+      │                               （RT → 换 accessToken → 查状态 → 必要时领取）
+      ▼
+  summarize_result.py → Actions 运行摘要（白名单字段，无凭据、无原始响应）
 ```
 
-- 三条通道的优先级：**长效令牌 > 短效令牌 > 本机登录态文件**。
-- 长效令牌**随用随换**：每次运行换取一个新的接口令牌。轮换出的新高令牌不会立即让旧值失效，
-  因此 Actions 里存一份即可长期复用，**不需要回写 Secret**。
-- 签到接口本身**幂等**：当日已签到返回 `code=10001`，脚本自动跳过，不会重复领取。
-
----
-
-## 功能特性
-
-- **云端定时签到**：每天北京时间 09:00 自动签到，领 100 积分；当日已签到则幂等跳过，不重复领取。
-- **零硬编码凭据**：凭据全部走 GitHub Secrets / 环境变量，代码仓库里找不到任何密钥。
-- **适配 5.6.2+ 加密登录态**：走长效令牌通道，不依赖客户端常驻、也不需要本机解密能力。
-- **多渠道推送**：支持企业微信、PushPlus、Server酱（方糖）、Bark，成功 / 失败均可播报。
-- **日志脱敏**：**输出层 + 摘要层双重白名单过滤** —— 接口响应在写进结果前即被压缩为结论字段，
-  **完整响应永不进入 stdout / `result.json` / Actions 运行日志**；凭据**只报长度、连字符片段都不输出**。
-- **零依赖**：仅用 Python 标准库，无需安装第三方包。
-- **内置安全自检**：`security_audit.py` 在推送前扫描凭据泄露 / 危险代码 / 敏感文件。
-
----
-
-## 前置条件
-
-1. 已在本地**安装并登录 WorkBuddy 桌面客户端**（脚本需要读取本机登录态来取得凭据）。
-2. 拥有一个 **GitHub 账号**。
-3. （推荐）安装 [GitHub CLI](https://cli.github.com/) 并 `gh auth login`，用于一键把凭据写入 Secrets。未安装也可手动配置。
-
----
-
-## 项目结构
-
-```
-.
-├── .github/workflows/checkin.yml      # 工作流：定时 + 手动触发，结果写 Action 摘要
-├── scripts/
-│   ├── workbuddy_checkin.py           # 签到主脚本（长效令牌 / 短效令牌 / 文件，三通道）
-│   ├── gen_notify_config.py           # CI 环境从环境变量生成推送配置
-│   ├── sync_token_to_github.py        # 本机一键把凭据同步到 GitHub Secrets
-│   ├── copy_token_to_clipboard.py     # 复制凭据到剪贴板（手动配置兜底）
-│   └── summarize_result.py            # 白名单过滤，生成脱敏摘要
-├── security_audit.py                  # 部署前自检：扫描凭据泄露 / 危险代码
-├── requirements.txt                    # 零第三方依赖
-├── .gitignore
-├── LICENSE                            # MIT
-└── README.md
-```
-
----
-
-## 快速开始
-
-### 方式 A：Fork 本仓库（最简单）
-
-1. 点击仓库右上角 **Fork**，把本仓库复制到你的账号下。
-2. 进入你 Fork 出的仓库，按下方「配置 Secrets」添加凭据。
-3. 到 **Actions** 页面启用工作流，手动 **Run workflow** 验证一次即可。
-
-### 方式 B：手动新建仓库
-
-```bash
-git clone https://github.com/<你的用户名>/<新仓库名>.git
-cd <新仓库名>
-# 把本仓库的 .github/ scripts/ security_audit.py requirements.txt .gitignore LICENSE 复制进来
-git add .
-git commit -m "feat: WorkBuddy 每日自动签到 (GitHub Actions)"
-git push -u origin main
-```
-
-### 配置 Secrets
-
-凭据来自你本机 WorkBuddy 的登录态。最简单的方式是用自带脚本一键同步（需先 `gh auth login`）：
-
-```bash
-# 进入仓库目录，脚本自动读取本机登录态并写入 Secrets
-python scripts/sync_token_to_github.py
-
-# 或显式指定仓库
-python scripts/sync_token_to_github.py --repo <用户名>/<仓库名>
-
-# 只预览不写入
-python scripts/sync_token_to_github.py --dry-run
-```
-
-脚本会自动区分登录态是**明文**还是**加密信封**，并据此选择正确的凭据：
-
-| Secret 名 | 内容 | 适用客户端 | 必填 |
-|---|---|---|---|
-| **`WB_REFRESH_TOKEN`** | **长效令牌（明文）** —— 云端自行换取接口令牌 | **5.6.2+（推荐）** | 二选一 |
-| `WB_ACCESS_TOKEN` | 短效接口令牌直通 | 5.5.x 及更早 | 二选一 |
-| `WB_DOMAIN` | 接口域名，通常为 `www.codebuddy.cn` | 全部 | 可选（有默认值） |
-
-> 注意：令牌很长，**不要手动框选复制**（极易漏字符导致 401）。脚本通过 `gh secret set` 的 stdin 写入，不会出现在命令行历史里。
->
-> 旧变量名 `WORKBUDDY_ACCESS_TOKEN` / `WORKBUDDY_DOMAIN` 仍被脚本接受（向后兼容），但新配置请使用 `WB_` 前缀。
-
-**没有安装 `gh`？** 脚本会自动降级为手动指引：
-
-1. 仓库 `Settings → Secrets and variables → Actions → New repository secret`
-2. 添加 `WB_REFRESH_TOKEN`：运行 `python scripts/copy_token_to_clipboard.py` 复制到剪贴板后粘贴（不在屏幕打印，避免凭据留存终端历史）
-3. （可选）添加 `WB_DOMAIN`：值填本机登录态里的 `auth.domain`（也可用 `python scripts/copy_token_to_clipboard.py --domain` 复制）
-
-> ⚠️ 若脚本提示「加密信封，无法解密」，说明本机登录态是 5.6.2+ 的加密形态。
-> 此时**不要**把文件里的值直接复制粘贴 —— 请按脚本给出的指引先导出**明文长效令牌**。
-
-### 手动验证
-
-到仓库 **Actions** 页面 → 选择「WorkBuddy 每日自动签到」→ **Run workflow**。
-首次建议勾选 `check_only`（仅查询，不领取）确认接口联通，再跑一次真实签到。看到 `status: ok` 即配置成功。
-
----
-
-## 通知配置（可选）
-
-在 Secrets 中添加以下任意通道（可同时配置多个）：
-
-| Secret 名 | 用途 | 获取方式 |
-|---|---|---|
-| `WECOM_WEBHOOK` | 企业微信群机器人 | 群设置 → 群机器人 → 添加 → 复制 Webhook |
-| `PUSHPLUS_TOKEN` | 个人微信推送 | 注册 https://www.pushplus.plus ，复制一对一推送 token |
-| `BARK_URL` | iOS 推送 | 安装 Bark App，复制 `https://api.day.app/<KEY>/` |
-| `SERVERCHAN_SENDKEY` | 个人微信推送（Server酱 / 方糖） | 微信扫码登录 https://sct.ftqq.com ，复制 SendKey（形如 `SCTxxxxx`） |
-| `SUCCESS_NOTIFY` | 设为 `true` 时签到成功也播报（默认仅失败提醒） | 填 `true` |
-
-```bash
-# 也可在同步凭据时一并写入通知 Secret
-python scripts/sync_token_to_github.py \
-  --wecom "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
-```
-
-全部留空则静默运行，仅靠 Actions 页面查看结果。
-
----
-
-## 运行结果说明
-
-签到脚本输出 JSON，关键字段：
-
-| status | action | 含义 | 处理 |
-|---|---|---|---|
-| `ok` | `clicked` | 本次领取成功 | 查看 `points`（本次积分）、`balance`（余额） |
-| `ok` | `skip_already_signed` | 今日已签到，自动跳过 | 正常，无需处理 |
-| `ok` | `skip_check_only` | 仅查询模式 | 查看 `detail.today_signed` |
-| `error` | `failed` | 签到失败 | 查看 `msg`，见下表 |
-
-`detail.credential` 会写明本次实际使用的凭据通道（如 `refresh_token（长效令牌）`），便于排查。
-
-**失败常见原因**
-
-| msg 关键词 | 原因 | 解决 |
-|---|---|---|
-| 长效令牌刷新失败 | `WB_REFRESH_TOKEN` 已失效 | 本机重跑 `python scripts/sync_token_to_github.py` |
-| 加密信封 / 云端无法解密 | Secret 里填的是 5.6.2+ 的登录态原始值 | 改用**明文长效令牌**：本机导出后填 `WB_REFRESH_TOKEN` |
-| 401 / 未授权 / token 失效 | `WB_ACCESS_TOKEN` 已过期 | 重跑 `sync_token_to_github.py`，或改用长效令牌通道 |
-| 404 | 域名错误 | 检查 `WB_DOMAIN` 是否为本机 `auth.domain` 的值 |
-| 网络错误 | runner 网络问题 | 重跑 workflow，或临时改用手动触发 |
-| 未配置任何凭据 | Secret 未配置 | 按「配置 Secrets」步骤操作 |
-
----
-
-## 凭据续期
-
-| 通道 | 有效期 | 续期方式 |
-|---|---|---|
-| `WB_REFRESH_TOKEN`（长效令牌） | 约 60 天 | 重新登录客户端后，本机重跑 `python scripts/sync_token_to_github.py` |
-| `WB_ACCESS_TOKEN`（短效令牌） | 约 2 个月 | 同上 |
-
-续期脚本会覆盖旧 Secret，无需其他操作。依赖「失败推送」通道即可在过期时收到提醒。
-
----
-
-## 本地自测（可选）
-
-```bash
-# 1. 环境自检（读取本机登录态 / 检查凭据通道与网络）
-python scripts/workbuddy_checkin.py --diagnose
-
-# 2. 用环境变量模拟 CI 环境
-export WB_ACCESS_TOKEN="你的短效令牌"     # 或 WB_REFRESH_TOKEN="你的长效令牌"
-export WB_DOMAIN="www.codebuddy.cn"
-python scripts/workbuddy_checkin.py --check-only   # 只查不领
-python scripts/workbuddy_checkin.py                # 查 + 必要时领取
-
-# 3. 推送前安全自检
-python security_audit.py
-```
-
----
-
-## 安全说明
-
-### 凭据保护
-
-- 凭据通过 **GitHub Secrets 加密存储**，日志中永不回显。
-- **日志脱敏已收紧到「只报长度、连字符片段都不输出」**：Actions 运行日志在公开仓库里人人可读，
-  连 `eyJhbG...sw5c` 这种「看起来安全」的片段也属于白送信息，因此一律不回显。
-  需要肉眼核对片段时，请在本机单独运行导出脚本（输出不落 CI 日志）。
-- 通过 `gh secret set` 的 **stdin** 写入，避免密钥出现在命令行参数（`ps` 可见）中。
-- 复制凭据用剪贴板脚本，避免凭据留存在终端历史中。
-
-### 日志脱敏（多层防护）
-
-Actions 运行日志与摘要会长期留存，因此做了多层防护：
-
-| 层级 | 措施 |
+| 关键事实 | 值 |
 |---|---|
-| **输出层** | `_slim_resp()` 把接口响应**白名单压缩**后才写入 `detail`：只保留结论字段（`code` / `msg` / `credit` / `total_credits` / `today_checked_in` 等）与**字段名清单**，其余内容一律丢弃。**完整响应永不进入 stdout / `result.json` / artifact / 摘要**（本机调试可临时 `set WB_DUMP_RESP=1` 放开，CI 中永不设置） |
-| 脚本层 | 输出 `detail.token_masked` 只含「已配置，长度 N」；`auth_file` 只含路径 / 变量名不含凭据 |
-| 摘要层 | `summarize_result.py` **白名单过滤**，只输出结论字段，不输出原始接口响应 |
-| 兜底层 | 任何长度 ≥80 的 base64url 风格长串替换为 `<REDACTED>`，防接口变更引入非预期字段 |
-| 自检层 | `security_audit.py` 扫描硬编码凭据、**登录态加密信封**、危险代码、敏感文件 |
+| 唯一必填 Secret | `WB_ACCOUNTS_JSON`，内容形如 `{"accounts":[{"name":"account01","refresh_token":"eyJ…"}]}`（模板见 `accounts.example.json`） |
+| 定时 | 每天 UTC 01:00 / 北京 09:00；GitHub 整点任务常有数分钟~数十分钟延迟，属正常 |
+| 单机依赖 | 本机只要 Python 3（纯标准库，不需要 requests）+ GitHub CLI `gh`；**不依赖 WorkBuddy 桌面客户端** |
+| 单账号失败 | 独立子进程隔离，不影响其余账号；最终按退出码决定是否让整个 run 失败 |
+| 幂等 | 当日已签到返回 `code=10001`，脚本跳过，不会重复领取 |
+| RT 轮换 | 服务端每次刷新会换发新 RT，但**旧值不立即作废**（本 fork 已用真实 RT 连刷两次实测 `old_token_reusable=true`），因此 Actions 不需要回写 Secret |
+| 多账号 | 逐账号串行，每号最多 180 秒；job 总超时 20 分钟，账号很多时按需要调大 workflow 的 `timeout-minutes` |
 
-### 工作流安全
-
-| 项 | 措施 |
-|---|---|
-| 权限 | `permissions: contents: read`（最小权限） |
-| 触发 | 仅 `schedule` + `workflow_dispatch`，**无 `pull_request_target`**（防 PR 投毒） |
-| 并发 | `concurrency` 固定组名，防止重复领取 |
-| 超时 | `timeout-minutes: 10` |
-| 退出码 | 用 `PIPESTATUS[0]` 精确取脚本退出码，确保失败必定告警，不会静默成功 |
-| 凭据校验 | 独立的 guard 步骤先确认凭据已配置，缺失时立即失败并给出配置指引 |
-
-### 部署前检查清单
-
-- [ ] `notify_config.json` **未**被提交（`.gitignore` 已覆盖，可 `git status` 确认）
-- [ ] 确认提交的文件中无凭据（运行 `python security_audit.py` 自检）
-- [ ] 首次部署先用 `check_only` 手动跑一次，确认 `status: ok`
-- [ ] 配好失败通知（企微 / PushPlus / Server酱 / Bark），否则失败只能靠 GitHub 邮件
-- [ ] **仓库可见性自行评估**：若设为 public，Actions 运行日志对所有人可见（本项目已脱敏无敏感信息，但仍建议在 `Settings → Actions → General` 保持最小权限）；同时请自行评估平台对于自动化脚本刷分的规则风险
-
-### 切勿做的事
-
-- 不要把凭据硬编码进任何文件或 workflow。
-- 不要把 `notify_config.json` 提交到仓库。
-- **不要把登录态文件（`workbuddy-desktop.info`）或其内容复制进仓库** —— 5.6.2+ 下它是加密信封，既不可用也不该外传。
-- 不要把凭据粘贴到聊天工具、Issue、PR 描述中。
-- 凭据一旦疑似泄露：立即在本机退出并重新登录 WorkBuddy（使旧凭据失效），再更新 Secret。
+**为什么不读本机登录态**：客户端 5.6.2+ 起 `workbuddy-desktop.info` 是 AES-256-GCM 加密信封，密钥只驻留客户端进程内存（且相关解密分支是 Windows-only），macOS 上取不到明文。短信登录由服务端直接下发 RT，整条死结被绕开，Linux runner 也能用。
 
 ---
 
-## 常见问题
+## 2. 一次性初始化
 
-**Q：Fork 后需要改代码吗？**
-A：不需要。直接配置自己的 Secrets 即可运行，所有凭据都走 Secrets。
+> **本 fork 已完成这一节，可跳过。** 只有换机器、重建仓库、或把这套搬到别的账号时才需要照做。
 
-**Q：我的客户端是新版，为什么旧教程说的 accessToken 用不了？**
-A：5.6.2 起登录态已加密，`accessToken` 不再是明文。请改用**长效令牌** `WB_REFRESH_TOKEN`
-（见本文开头「版本对照」表）。脚本会自动识别并提示。
-
-**Q：凭据从哪来？**
-A：来自你本机 WorkBuddy 桌面客户端的登录态。`sync_token_to_github.py` 会自动读取并选择正确的凭据类型。
-
-**Q：公开仓库会不会泄露我的凭据？**
-A：不会。凭据只存在于你自己的 Secrets，不进代码、不进日志（且日志已收紧为只报长度）。
-你 Fork 的仓库别人也读不到你的 Secret。
-
-**Q：签到时间能改吗？**
-A：编辑 `.github/workflows/checkin.yml` 里的 `cron` 表达式即可（UTC 时间）。
-
-**Q：一直接收不到失败提醒？**
-A：检查是否配置了任一通知通道 Secret；否则失败只体现为 Actions 页面红灯与 GitHub 邮件。
+1. **Fork / 导入仓库**，建议设为 **Private**（Actions 日志虽已脱敏，公开没有额外好处）。
+2. **启用 Actions**：仓库 `Actions` 页 → 允许工作流；`Settings → Actions → General` 保持最小权限（workflow 已声明 `permissions: contents: read`）。
+3. **准备 `gh`**：本机安装 [GitHub CLI](https://cli.github.com/) 并 `gh auth login`（需要 `repo` 权限；若要改 workflow 文件还需 `workflow` scope）。写 Secret 时脚本通过 `gh secret set` 的 stdin 传入，令牌不出现在命令行 / `ps` / shell history。
+4. **导入第一个账号**：按 §3.1 跑 `sms_login.py`。
+5. **写 Secret**：按 §3.2 跑 `set_accounts_secret.py`。
+6. **首次验收**：Actions 页手动 **Run workflow** 勾 `check_only`，确认 `成功 1/1`；再跑一次不勾的正式签到。
+7. （可选）配置失败通知 Secret，见 §3.6。
 
 ---
 
-## 更新记录
+## 3. 日常操作
 
-| 版本 | 变更 |
+### 3.1 加一个账号
+
+在仓库根目录（**必须**，否则 `accounts.json` 会落到 `.gitignore` 覆盖不到的地方）：
+
+```bash
+cd ~/Codes/workbuddy-checkin-nobody
+python3 scripts/sms_login.py --alias account02
+```
+
+交互过程：输手机号 → 手机收到 6 位验证码（约 300 秒有效）→ 输验证码 → 脚本自动用该 RT 试刷新一次，成功后以 0600 写入 `accounts.json`。
+
+**也可以拆成两步**（让助手代跑、或验证码在别处输入）：
+
+```bash
+python3 scripts/sms_login.py --alias account02 --phone '<你的手机号>' --send-only
+# 收到短信后：
+python3 scripts/sms_login.py --alias account02 --code 123456
+# 验证码也可从 stdin 读： --code -  （配合管道，不进命令行）
+```
+
+输出只含脱敏信息，长这样：
+
+| 字段 | 含义 |
 |---|---|
-| **`workbuddy_checkin.py` v2.2.0-ci** | 修复**输出层脱敏缺口**：接口响应改为**白名单压缩**后才写入 `detail`，避免完整响应经 `tee` 进入公开的 Actions **运行日志**（此前只有摘要层做了过滤）。新增 `WB_DUMP_RESP=1` 本机调试开关；口径与摘要层统一。 |
-| **`workbuddy_checkin.py` v2.1.0-ci** | ① 新增**长效令牌通道**（`WB_REFRESH_TOKEN`）：先向插件网关换取接口令牌再签到，适配套客户端 5.6.2+ 的加密登录态，且不依赖客户端常驻；② 识别登录态**加密信封**并给出明确报错与指引，不再静默鉴权失败；③ 余额字段补齐新版复数 `total_credits`（旧版只认单数，导致余额恒为空）；④ `mask_token()` 收紧为**只报长度**，适配公开仓库的日志可见性；⑤ `--diagnose` 改为报告凭据通道与刷新结果。<br>配套：`sync_token_to_github.py` / `copy_token_to_clipboard.py` 改为优先导出**长效令牌**；`security_audit.py` 新增登录态信封检测；workflow 更新 Secret 注入与 guard 步骤。 |
-| v2.0.0 | 首个 GitHub Actions 版本：接口直签、多渠道推送、日志脱敏、部署前自检。 |
+| `action: added` / `updated` | 新增 / 同名覆盖 |
+| `masked` | RT 脱敏指纹（`eyJhbG…(len=698)`），**不含可用片段** |
+| `refresh_probe.ok: true` | 该 RT 能被刷新端点消费，云端可用 |
+| `refresh_probe.rotated: true` | 服务端确实会轮换（正常，见 §1） |
+| `total` / `file_mode: 0600` / `state_cleared` | 当前账号数、文件权限、待验证状态已清 |
+
+**别名规则**：仅字母/数字/`_`/`-`，≤32 字符，不可重复。建议 `account01`、`account02`… 依次递增。
+
+**脚本会拒绝的东西**：网页授权码 `WBAUTH1:`、加密信封 `$wbEncrypted`、短效令牌、长度/格式不对的字符串——这些填进 Secret 必然 401。
+
+### 3.2 更新 Secret（每次加号 / 续期后必做）
+
+```bash
+cd ~/Codes/workbuddy-checkin-nobody
+
+# 0) 本机 gh 若不在 PATH，先补上；写 Secret 需要 GH_TOKEN 或已 gh auth login
+export PATH="$HOME/.local/bin:$PATH"
+export GH_TOKEN=$(cat ~/.config/wb-checkin-gh-token)   # 0600 文件；也可改用 gh auth login
+
+# 1) 离线校验 + 只预览（不写入）
+python3 scripts/multi_checkin.py --accounts-file accounts.json --validate
+python3 scripts/set_accounts_secret.py accounts.json \
+  --repo lxuanzheng/workbuddy-checkin-nobody --dry-run
+
+# 2) 正式覆盖写入（幂等）
+python3 scripts/set_accounts_secret.py accounts.json \
+  --repo lxuanzheng/workbuddy-checkin-nobody
+
+# 3) 远端确认（只列名，不显示值）
+gh secret list --repo lxuanzheng/workbuddy-checkin-nobody
+```
+
+`set_accounts_secret.py` 会把本地 JSON 经 stdin 交给 `gh secret set WB_ACCOUNTS_JSON`，覆盖旧值；`--repo` 不填则取当前目录 git remote。
+
+### 3.3 查看 / 删除账号
+
+```bash
+python3 scripts/add_account.py --list  --accounts accounts.json
+python3 scripts/add_account.py --remove account02 --accounts accounts.json
+```
+
+删完**必须重跑 §3.2**，否则云端仍按旧 Secret 跑已删的号。
+
+### 3.4 手动触发与验收
+
+网页：`Actions` → `WorkBuddy 每日自动签到（多账号）` → **Run workflow**
+
+| `check_only` | 行为 |
+|---|---|
+| ✅ 勾选 | 只查状态，不领积分。首次配置、加完号、改完 Secret 后用它验收 |
+| ❌ 不勾 | 正式签到；当日已签自动跳过 |
+
+命令行等价：
+
+```bash
+gh workflow run checkin.yml --repo lxuanzheng/workbuddy-checkin-nobody -f check_only=true
+RUN_ID=$(gh run list --workflow=checkin.yml --repo lxuanzheng/workbuddy-checkin-nobody \
+         --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run watch "$RUN_ID" --repo lxuanzheng/workbuddy-checkin-nobody --interval 5
+gh run view  "$RUN_ID" --repo lxuanzheng/workbuddy-checkin-nobody --json conclusion,url
+```
+
+**看结果**：run 页面底部的 **Summary** 是多账号汇总表（每号 status / 结论字段），`成功 N/N` 表示全部成功。注意日志里回显的 `ARGS="--check-only"` 是 GitHub 打印的**脚本源码**，不是执行结果，别据此判断有没有领。
+
+> 定时触发（`event=schedule`）时 `check_only` 判断必然为假，**一定走正式领取**，不用担心每天只在查询。
+
+### 3.5 令牌到期续期
+
+长效令牌约 **30 天**有效（以令牌自身 `exp` 为准；上游 README 写 60 天偏乐观）。到期表现：Actions 开始报「长效令牌刷新失败 / 401」。
+
+**保守做法：每月重导一次，或配好失败通知后按需处理。**
+
+```bash
+python3 scripts/sms_login.py --alias account01      # 同名覆盖旧 RT
+python3 scripts/sms_login.py --alias account01 --check --accounts accounts.json   # 可选：连刷两次验证轮换
+python3 scripts/set_accounts_secret.py accounts.json --repo lxuanzheng/workbuddy-checkin-nobody
+```
+
+`--check` 只读、不签到、不改配置，输出 `old_token_reusable` 用来确认旧值仍可复用（到期前通常都是 true）。
+
+> 短信登录**可能让该账号其他端的会话失效**（上游会作废整个会话，最后登录的才有效）。桌面客户端掉线重登一次即可，不是故障。
+
+### 3.6 改时间 / 配通知
+
+- **改签到时间**：编辑 `.github/workflows/checkin.yml` 的 `cron`（**UTC**）。北京 09:00 = `'0 1 * * *'`。
+- **失败通知**（可选，Secrets 里添加任意一个即生效；默认仅失败提醒）：
+
+| Secret | 用途 |
+|---|---|
+| `WECOM_WEBHOOK` | 企业微信群机器人 Webhook |
+| `PUSHPLUS_TOKEN` | PushPlus 个人微信推送 |
+| `BARK_URL` | iOS Bark，形如 `https://api.day.app/<KEY>/` |
+| `SERVERCHAN_SENDKEY` | Server酱 / 方糖 SendKey |
+| `SUCCESS_NOTIFY` | 填 `true` 时成功也播报 |
+
+全留空则静默运行，只能到 Actions 页看结果（GitHub 默认会发失败邮件）。
+
+---
+
+## 4. 文件说明
+
+| 路径 | 作用 |
+|---|---|
+| `.github/workflows/checkin.yml` | 定时 + 手动触发；注入 `WB_ACCOUNTS_JSON`；离线 guard → 签到 → 摘要 |
+| `scripts/sms_login.py` | **新增**。短信登录换明文 RT，写入 `accounts.json`（0600、脱敏、同号覆盖、不进日志） |
+| `scripts/multi_checkin.py` | **新增**。多账号编排：逐账号独立子进程，失败隔离，结果写 0600 文件而非 stdout |
+| `scripts/set_accounts_secret.py` | **新增**。`accounts.json` → `WB_ACCOUNTS_JSON` Secret（stdin，支持 `--dry-run`） |
+| `scripts/add_account.py` | **新增**。账号增 / 删 / 列（脱敏）；支持剪贴板、文件、stdin 输入 |
+| `scripts/summarize_result.py` | 改：增多账号汇总表，向下兼容单账号结果 |
+| `scripts/workbuddy_checkin.py` | 上游原脚本，未改：单个账号的查状态 / 领取 / 刷新 RT / 推送 |
+| `scripts/gen_notify_config.py`、`scripts/copy_token_to_clipboard.py`、`scripts/sync_token_to_github.py` | 上游遗留工具，**本方案不用**（后者依赖本机登录态，macOS 5.6.2+ 解不出） |
+| `accounts.example.json` | 配置模板（占位符，**不含真实令牌**） |
+| `accounts.json` | 本机真实配置，**已 gitignore，绝不提交** |
+| `.sms-state.json` | 短信登录待验证状态（只存别名与手机号，0600，已 gitignore） |
+| `security_audit.py` | 部署前自检：凭据泄露 / 危险代码 / 敏感文件 |
+
+`.gitignore` 已挡住 `accounts.json`、`.sms-state.json`、`result.json`、`*.log`、`workbuddy-desktop.info`、`notify_config.json` 等。改完可跑 `git status --short` 与 `python3 security_audit.py` 复核。
+
+> **关于 `security_audit.py` 的一条预期告警**：本机一旦导入过账号，就会存在含真实 RT 的 `accounts.json`。该脚本扫描的是**目录里所有文件**（不按 `.gitignore` 过滤），因此会报：
+> ```
+> [2] 凭据泄露扫描
+>     [严重] accounts.json    JWT 格式 token
+> 结论：泄露风险 有
+> ```
+> 这是**正常的、预期的**，说明本机凭据确实存在且被保护着，不代表会泄露。判断是否安全以 `git status --short` / `git ls-files` 为准：只要 `accounts.json` 没出现在其中，就不会进仓库（`[4] 敏感文件误入库` 一栏应为「通过」）。**不要为了消掉这条告警去删 `accounts.json`**——删了就得重新收短信导号。
+
+---
+
+## 5. 结果解读与排错
+
+单账号结果字段（来自原签到脚本，经白名单压缩）：
+
+| status | action | 含义 |
+|---|---|---|
+| `ok` | `clicked` | 本次领取成功，看 `points` / `balance` |
+| `ok` | `skip_already_signed` | 今日已签到，正常跳过 |
+| `ok` | `skip_check_only` | 只读模式，看 `detail.today_signed` |
+| `error` | `failed` | 失败，看 `msg` |
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `未配置凭据` / guard 失败 | Secret 没写或名字不对 | 只认 `WB_ACCOUNTS_JSON`；按 §3.2 重写 |
+| `成功 0/N`、`长效令牌刷新失败` / 401 | RT 过期或填错形态 | 重跑 `sms_login.py` 该别名 → 覆盖 Secret（§3.5） |
+| 加了账号但云端没跑它 | 忘了覆盖 Secret | §3.2 |
+| 报「加密信封无法解密」 | 把 `workbuddy-desktop.info` 的值塞进了配置 | 改用短信登录取明文 RT；`add_account.py` 会直接拒收 |
+| `phone is required` / 验证码错误 | 手机号格式或验证码过期（约 300 秒） | 重发一次，`--send-only` + `--code` 两步走 |
+| 桌面客户端掉线 | 短信登录作废旧会话 | 客户端重新登录一次 |
+| 404 / 域名错误 | `domain` 填错 | 删掉该字段用默认，或填 `www.codebuddy.cn` |
+| Actions 一直不自动跑 | fork 默认可能禁用 scheduled workflow | Actions 页确认已启用；也可先手动 Run 一次 |
+| 定时没在 09:00 准点 | GitHub 排队延迟 | 正常，数十分钟内都算预期 |
+
+本机排查辅助：
+
+```bash
+python3 scripts/multi_checkin.py --accounts-file accounts.json --validate       # 离线配置校验
+python3 scripts/multi_checkin.py --accounts-file accounts.json --check-only     # 本机逐账号只读查询
+python3 scripts/sms_login.py --alias account01 --check --accounts accounts.json # RT 连刷验证
+python3 security_audit.py                                                       # 凭据/危险代码自检
+python3 scripts/workbuddy_checkin.py --diagnose                                  # 上游环境自检（读本机登录态，本方案不用）
+```
+
+---
+
+## 6. 安全边界与红线
+
+| 层 | 措施 |
+|---|---|
+| 本机 | `accounts.json` / `.sms-state.json` / `result.json` 均 0600，且被 `.gitignore` 排除 |
+| 传输 | 令牌经 `gh secret set` 的 **stdin** 写入，不进命令行、`ps`、shell history、对话 |
+| 云端 | Secret 加密存储；`permissions: contents: read`；仅 `schedule` + `workflow_dispatch`，无 `pull_request_target` |
+| 日志 | 输出层白名单压缩 + 摘要层白名单 + 长度 ≥80 的长串一律 `<REDACTED>`；完整接口响应永不进 stdout / 日志 / artifact |
+| 代码 | `security_audit.py` 扫描硬编码凭据、加密信封、危险代码 |
+
+**切勿**：
+
+- ❌ 把 `accounts.json`、令牌、验证码、含 `session` Cookie 的 curl 贴进对话 / Issue / commit。
+- ❌ 把 `workbuddy-desktop.info` 或其内容复制进仓库（5.6.2+ 下既不可用也不该外传）。
+- ❌ 把仓库设成 public 后又放宽 Actions 权限；本 fork 建议 **Private**。
+- ❌ 用代理轮换 IP / 改设备指纹去绕风控。多账号自动化本身已有平台条款与风控风险，多个同类项目 README 都自行标明；账号数量克制，别贪。
+- ❌ 把用于部署的 PAT 长期留着：临时生成、用完立即在 https://github.com/settings/tokens **Revoke**，并删除本机保存它的 0600 文件。
+
+凭据疑似泄露时：网页端退出登录再重登（使旧会话失效）→ 重跑 `sms_login.py` 覆盖所有账号 RT → 重写 Secret → 撤销相关 PAT。
+
+---
+
+## 7. 本机环境备忘（这台 Mac，2026-11-13 核实）
+
+| 项 | 值 / 说明 |
+|---|---|
+| 本 fork | `lxuanzheng/workbuddy-checkin-nobody`（`main`） |
+| 本机 clone | `~/Codes/workbuddy-checkin-nobody` |
+| `gh` 二进制 | `~/.local/bin/gh`（v2.104.0，从 Homebrew bottle 提取，**不在 PATH**）→ 用前 `export PATH="$HOME/.local/bin:$PATH"` |
+| 写 Secret 的认证 | `export GH_TOKEN=$(cat ~/.config/wb-checkin-gh-token)`（该文件 0600）；或改成一次 `gh auth login` |
+| Python | 系统 `python3`，脚本全部只用标准库 |
+| 已跑通 | 云端 `check_only` 与正式签到两次 run 均 `成功 1/1`；`today_checked_in=true`、连签 36 天、余额 3600 分 |
+| 当前账号 | **`account01` 一个**（手机号尾号 8491）。加号时用 `account02`、`account03`… |
+| 待办清理 | 部署用的临时 PAT 待 Revoke + 删除上述 0600 文件；曾在对话中贴出的网页 `session` Cookie 建议退出重登使其失效 |
+
+> 这节是**状态快照**，会过期；操作知识以 §0–§6 为准。
+
+---
+
+## 8. 常见问题
+
+**Q：Mac 关机 / 不装 WorkBuddy 客户端还能签吗？**
+A：能。签到完全在 GitHub 云端 runner 上跑，本机只在「加账号」和「令牌续期」时需要联网一次。
+
+**Q：一个账号要收几次短信？**
+A：首次一次，之后约每 30 天续期一次。日常每天自动签到不再需要手机。
+
+**Q：加完号要不要改 workflow / 代码？**
+A：不用。账号数量与 workflow 无关，只覆盖 `WB_ACCOUNTS_JSON` 这一个 Secret。
+
+**Q：今天已经手动签过了，Actions 再跑会重复领吗？**
+A：不会，接口幂等，返回「今日已签」自动跳过。
+
+**Q：为什么 RT 会轮换却不用回写 Secret？**
+A：实测连刷两次旧值仍可用（`old_token_reusable=true`），服务端换发的新 RT 不会立即作废旧值。因此 Actions 每天用同一份 Secret 即可。
+
+**Q：把 refresh token 换成网页 Cookie 行不行？**
+A：不行。网页端是 Cookie 会话体系，与插件网关的 `X-Refresh-Token` 是两套认证；且 Cookie 约 7 天过期、绑定 UA、云端出口 IP 不同，不适合 Actions。
+
+**Q：能改签到时间吗？**
+A：能，改 `.github/workflows/checkin.yml` 的 `cron`（UTC），改 workflow 文件的推送需要 PAT 带 `workflow` scope。
+
+---
+
+## 9. 改造记录
+
+| 提交 | 变更 |
+|---|---|
+| `c05a581` | 上游 `tslshuli/workbuddy-checkin-public` 单账号基线 |
+| `977ff7e` | 多账号改造：`multi_checkin.py` / `add_account.py` / `set_accounts_secret.py` / `accounts.example.json`；workflow 改注入 `WB_ACCOUNTS_JSON` + 离线 guard；摘要层兼容多账号 |
+| `7438fbe` | 弃用无效的「浏览器 Console 取令牌」路线，新增 `sms_login.py`（官方短信登录换明文 RT），删除错误产物 `templates/export-refresh-token.js` |
+| 本次 | README 整体重写为多账号版使用教程，移除过时的单账号配置说明 |
+
+上游未改动的能力：签到主脚本、状态查询、四类通知推送、日志脱敏、`security_audit.py`、MIT 许可。
 
 ---
 
