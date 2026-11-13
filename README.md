@@ -1,5 +1,42 @@
 # WorkBuddy 每日自动签到 · GitHub Actions 版
 
+> ## 本副本已改造为「多账号版」（2026-11-13）
+>
+> **下文是上游单账号版文档，其中 `WB_REFRESH_TOKEN` / `WB_ACCESS_TOKEN` 两个 Secret
+> 在本副本的 workflow 中不再生效**，照抄会 guard 失败。本副本只认一个 Secret：
+>
+> | Secret | 内容 |
+> |---|---|
+> | `WB_ACCOUNTS_JSON` | 账号数组 `[{"name":"main","refresh_token":"<长效令牌>"}, ...]`，格式见 `accounts.example.json` |
+>
+> - 入口：`scripts/multi_checkin.py` → 逐账号起独立子进程调用原签到脚本，单账号失败不影响其余。
+> - 本地校验（离线、不联网、不回显令牌）：`python3 scripts/multi_checkin.py --accounts-file accounts.json --validate`
+> - 写入 Secret（令牌经 stdin 传给 gh，不进命令行）：`python3 scripts/set_accounts_secret.py accounts.json --repo <owner>/<repo>`
+> - 首次部署在 Actions 页手动 **Run workflow** 并勾选 `check_only`，确认全账号 `status: ok` 再等定时。
+> - `accounts.json` 已在 `.gitignore` 中排除，**切勿提交**；长效令牌约 60 天需重新导出更新 Secret。
+> - 单账号用法仍保留：直接运行 `python3 scripts/workbuddy_checkin.py`。
+>
+> ### 配置多账号（macOS 5.6.2+ 必读）
+>
+> 客户端 5.6.2 起登录态是 AES-256-GCM 信封，解密密钥只在客户端进程内存里，
+> **本机脚本无法自动导出明文长效令牌**；且 N 个账号必须各自登录一次。
+> 因此采用「浏览器取令牌 → 剪贴板 → 脚本入库」的方式，令牌全程不进命令行、日志或对话：
+>
+> 1. 浏览器登录 `https://www.workbuddy.cn`，在该账号页面运行
+>    `templates/export-refresh-token.js`（Console 粘贴或存成书签），令牌进剪贴板。
+>    若提示未找到，用 DevTools → Network → `token/refresh` 响应的 `refreshToken` 字段。
+> 2. 换下一个账号重复第 1 步。
+> 3. 每个账号各跑一次：`python3 scripts/add_account.py --alias main`
+>    （默认从剪贴板读，校验形态后以 0600 原子写入 `accounts.json`，随后清空剪贴板）。
+> 4. `python3 scripts/add_account.py --list` 只看别名与脱敏指纹；
+>    `--remove <别名>` 删号；`--source file --file <路径>` 可改用文件输入。
+>
+> 脚本会拒绝网页授权码（`WBAUTH1:`）、加密信封（`$wbEncrypted`）和短效令牌——
+> 这三类填进 Secret 必然 401。
+>
+> 其余说明（接口原理、5.6.2+ 加密登录态、脱敏、通知配置）下文依然有效。
+
+
 用 GitHub Actions 定时完成 WorkBuddy「Buddy 加油站」每日签到。**接口直签，无需常驻本机、无需开机、无需 GUI**。
 
 > 安全说明：本仓库的代码（脚本 / workflow）**不含任何凭据**，可放心 Fork 与使用。登录凭据仅保存在你自己的 GitHub Secrets 中，绝不会出现在代码里。

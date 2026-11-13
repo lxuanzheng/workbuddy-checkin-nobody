@@ -1,32 +1,36 @@
-name: WorkBuddy 每日自动签到
+name: WorkBuddy 每日自动签到（多账号）
 
 # ─────────────────────────────────────────────────────────────
-#  WorkBuddy「Buddy 加油站」每日签到 · GitHub Actions 版
-#  原理：从仓库 Secrets 读取凭据，直接调用官方签到接口
-#       （接口直签，无需 GUI，无需本机常驻）
-#  凭据（长效令牌优先，适配客户端 5.6.2+）：
-#    WB_REFRESH_TOKEN — 长效令牌，每次运行先向插件网关换取接口令牌（推荐）
-#    WB_ACCESS_TOKEN  — 短效接口令牌直通（兼容 5.5.x 及更早 / 未加密登录态）
-#  两者都配时脚本会优先使用 WB_REFRESH_TOKEN。
+#  WorkBuddy「Buddy 加油站」每日签到 · GitHub Actions 多账号版
+#  原理：一份 Secret 装全部账号，编排器逐账号起独立子进程调用原签到脚本
+#       （接口直签，无需 GUI、无需本机常驻、客户端不开也能跑）
+#
+#  唯一必填 Secret：
+#    WB_ACCOUNTS_JSON — JSON 数组，形如
+#      [{"name":"main","refresh_token":"<长效令牌>"},
+#       {"name":"alt01","refresh_token":"<长效令牌>","domain":"www.codebuddy.cn"}]
+#      name 只允许字母/数字/_/-，不可重复。
+#      5.6.2+ 客户端必用 refresh_token；旧客户端可用 access_token。
+#
+#  单账号脚本仍保留：直接跑 scripts/workbuddy_checkin.py 即可。
 # ─────────────────────────────────────────────────────────────
 
 on:
   schedule:
     # GitHub Actions 使用 UTC 时间；北京时间 09:00 = UTC 01:00
-    # ⚠️ 定时任务在整点前后可能有数分钟~数十分钟延迟，属 GitHub 正常现象
+    # 定时任务在整点前后可能有数分钟~数十分钟延迟，属 GitHub 正常现象
     - cron: '0 1 * * *'
-  # 支持在 Actions 页面手动触发（首次配置后建议先手动跑一次验证）
   workflow_dispatch:
     inputs:
       check_only:
-        description: '仅查询状态，不执行领取'
+        description: '仅查询状态，不执行领取（首次配置建议先勾这个）'
         required: false
         default: false
         type: boolean
 
 # 同一时间只保留一个运行实例，避免并发重复领取
 concurrency:
-  group: workbuddy-checkin
+  group: workbuddy-checkin-multi
   cancel-in-progress: false
 
 permissions:
@@ -34,40 +38,29 @@ permissions:
 
 jobs:
   checkin:
-    name: 执行签到
+    name: 多账号签到
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 逐账号串行执行，每个子进程最多 180s；账号多时按需要调大
+    timeout-minutes: 20
 
     env:
-      # 凭据（脚本自动识别，长效令牌优先）
-      WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
-      WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
-      WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
+      # 唯一凭据入口（内容永不外显）
+      WB_ACCOUNTS_JSON: ${{ secrets.WB_ACCOUNTS_JSON }}
       # 通知通道（可选，任一为空则跳过该通道）
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
       BARK_URL: ${{ secrets.BARK_URL }}
       SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-      # 签到成功是否也推送播报（可选，默认仅失败提醒）
       SUCCESS_NOTIFY: ${{ secrets.SUCCESS_NOTIFY }}
 
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 检查凭据是否已配置
+      - name: 校验账号配置（离线、不联网、不回显令牌）
         id: guard
         run: |
-          if [ -n "$WB_REFRESH_TOKEN" ]; then
-            echo "✓ 凭据已配置：WB_REFRESH_TOKEN（长效令牌，推荐；内容不外显）"
-          elif [ -n "$WB_ACCESS_TOKEN" ]; then
-            echo "✓ 凭据已配置：WB_ACCESS_TOKEN（短效令牌直通；内容不外显）"
-          else
-            echo "::error::未配置凭据。请在仓库 Settings → Secrets and variables → Actions 添加「WB_REFRESH_TOKEN」（客户端 5.6.2+ 必用，长效令牌）。"
-            exit 1
-          fi
-          # 只输出存在性结论，不输出 token 长度 / 内容 / 片段（长度也是可用于指纹识别的信息）
-          echo "✓ 接口域名：${WB_DOMAIN:-（默认 www.codebuddy.cn）}"
+          python scripts/multi_checkin.py --validate
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -79,36 +72,29 @@ jobs:
         run: |
           python scripts/gen_notify_config.py "$HOME/.workbuddy/scripts/notify_config.json"
 
-      - name: 环境自检（只读）
-        run: python scripts/workbuddy_checkin.py --diagnose
-
-      - name: 执行签到
+      - name: 执行多账号签到
         id: checkin
-        # 手动触发且勾选「仅查询」时不执行领取
+        # 结果写入文件而非 stdout，避免推送日志混入 JSON
         run: |
           ARGS=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.check_only }}" = "true" ]; then
             ARGS="--check-only"
           fi
-          # 注意：脚本用非 0 退出码表示签到失败。
-          # 管道会吞掉退出码（$? 变成 tee 的），因此这里用 PIPESTATUS 精确取 Python 的退出码，
-          # 否则签到失败也会被判为 success，导致失败告警失效。
           set +e
-          python scripts/workbuddy_checkin.py $ARGS | tee result.json
-          rc=${PIPESTATUS[0]}
+          python scripts/multi_checkin.py --out result.json $ARGS
+          rc=$?
           set -e
           echo "checkin_exit_code=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
 
       - name: 输出运行摘要
         if: always()
-        # 只输出白名单字段，不把完整 result.json 写入摘要
-        # （摘要会长期留存于 Actions 页面，应避免暴露原始接口响应全文）
+        # 只输出白名单字段，不把任何原始响应/凭据写进摘要
         run: |
           python scripts/summarize_result.py result.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: 失败时终止任务（触发 GitHub 失败通知）
         if: steps.checkin.outcome != 'success'
         run: |
-          echo "::error::签到未成功（退出码 ${{ steps.checkin.outputs.checkin_exit_code }}），请查看上方日志与运行摘要"
+          echo "::error::有账号签到未成功（退出码 ${{ steps.checkin.outputs.checkin_exit_code }}），请查看运行摘要"
           exit 1

@@ -15,6 +15,10 @@ notify_config.json.example
 *.secret
 credentials.json
 credentials*.json
+# 多账号配置（含明文长效令牌，绝不入库；模板 accounts.example.json 可入库）
+accounts.json
+accounts.local.json
+wb_accounts*.json
 *.pem
 *.key
 *.p12

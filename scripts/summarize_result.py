@@ -52,7 +52,40 @@ def _safe(v):
     return v
 
 
+def _cell(value):
+    """表格单元格：脱敏 + 转义竖线与换行，避免撑破 Markdown 表格。"""
+    out = _safe(value)
+    return str(out).replace("|", "\\|").replace("\n", " ")
+
+
+def build_multi_summary(data):
+    """多账号聚合结果：每账号一行，只输出白名单字段，不输出凭据。"""
+    lines = ["## WorkBuddy 多账号签到结果", ""]
+    lines.append("共 %s 个账号：成功 %s / 失败 %s" % (
+        _cell(data.get("total", "?")), _cell(data.get("succeeded", "?")),
+        _cell(data.get("failed", "?"))))
+    lines.append("")
+    lines.append("| 账号 | 结果 | 动作 | 本次积分 | 余额 | 说明 |")
+    lines.append("|---|---|---|---|---|---|")
+    for row in data.get("results") or []:
+        lines.append("| %s | %s | %s | %s | %s | %s |" % (
+            _cell(row.get("account", "?")),
+            _cell(STATUS_LABEL.get(row.get("status"), row.get("status"))),
+            _cell(ACTION_LABEL.get(row.get("action"), row.get("action") or "-")),
+            _cell(row.get("points") if row.get("points") is not None else "-"),
+            _cell(row.get("balance") if row.get("balance") is not None else "-"),
+            _cell(row.get("msg") or "-"),
+        ))
+    lines.append("")
+    if data.get("status") != "ok":
+        lines.append("> ⚠️ 有账号签到失败，请查看运行日志。常见原因：长效令牌过期"
+                     "（约 60 天，需重新导出并更新 Secret WB_ACCOUNTS_JSON）／域名配置错误。")
+    return "\n".join(lines) + "\n"
+
+
 def build_summary(data):
+    if data.get("mode") == "multi":
+        return build_multi_summary(data)
     lines = []
     lines.append("## WorkBuddy 签到结果")
     lines.append("")

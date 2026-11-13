@@ -1,0 +1,13 @@
+{
+  "accounts": [
+    {
+      "name": "main",
+      "refresh_token": "<账号1的长效令牌，由本机导出；切勿提交真实值>"
+    },
+    {
+      "name": "alt01",
+      "refresh_token": "<账号2的长效令牌>",
+      "domain": "www.codebuddy.cn"
+    }
+  ]
+}
