@@ -17,9 +17,9 @@ name: WorkBuddy 每日自动签到（多账号）
 
 on:
   schedule:
-    # GitHub Actions 使用 UTC 时间；北京时间 09:00 = UTC 01:00
-    # 定时任务在整点前后可能有数分钟~数十分钟延迟，属 GitHub 正常现象
-    - cron: '0 1 * * *'
+    # GitHub Actions 使用 UTC 时间；北京时间 08:17 = UTC 00:17
+    # 用非整点分钟避开整点排队高峰（整点 cron 实测延迟可达 6 小时以上）
+    - cron: '17 0 * * *'
   workflow_dispatch:
     inputs:
       check_only:
