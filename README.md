@@ -4,7 +4,7 @@
 >
 > 改造基线：上游 `c05a581` → 本 fork `7438fbe`（2026-11-13）。原项目 MIT，LICENSE 保留。
 
-**一句话**：每个账号用手机号收一次短信验证码，换到明文长效令牌（RT）；所有 RT 组装进一个 Secret `WB_ACCOUNTS_JSON`；GitHub Actions 每天北京时间 09:00 在云端逐账号签到。**Mac 不用开机、不用装客户端、不用常驻**。只有「加账号」和「令牌到期续期」需要本机跑一次命令。
+**一句话**：每个账号用手机号收一次短信验证码，换到明文长效令牌（RT）；所有 RT 组装进一个 Secret `WB_ACCOUNTS_JSON`；GitHub Actions 每天北京时间 08:17 在云端逐账号签到。**Mac 不用开机、不用装客户端、不用常驻**。只有「加账号」和「令牌到期续期」需要本机跑一次命令。
 
 ---
 
@@ -41,7 +41,7 @@
       ▼
 GitHub Secret: WB_ACCOUNTS_JSON   ← 唯一必填 Secret
       │
-      │  cron '0 1 * * *'（UTC）= 北京时间 09:00；也可手动 workflow_dispatch
+      │  cron '17 0 * * *'（UTC）= 北京时间 08:17；也可手动 workflow_dispatch
       ▼
 云端 ubuntu-latest runner
   multi_checkin.py --validate        先离线校验配置
@@ -54,7 +54,7 @@ GitHub Secret: WB_ACCOUNTS_JSON   ← 唯一必填 Secret
 | 关键事实 | 值 |
 |---|---|
 | 唯一必填 Secret | `WB_ACCOUNTS_JSON`，内容形如 `{"accounts":[{"name":"account01","refresh_token":"eyJ…"}]}`（模板见 `accounts.example.json`） |
-| 定时 | 每天 UTC 01:00 / 北京 09:00；GitHub 整点任务常有数分钟~数十分钟延迟，属正常 |
+| 定时 | 每天 UTC 00:17 / 北京 08:17；特意用非整点避开整点排队高峰，整点 cron 实测延迟可达 6 小时以上 |
 | 单机依赖 | 本机只要 Python 3（纯标准库，不需要 requests）+ GitHub CLI `gh`；**不依赖 WorkBuddy 桌面客户端** |
 | 单账号失败 | 独立子进程隔离，不影响其余账号；最终按退出码决定是否让整个 run 失败 |
 | 幂等 | 当日已签到返回 `code=10001`，脚本跳过，不会重复领取 |
@@ -189,7 +189,7 @@ python3 scripts/set_accounts_secret.py accounts.json --repo lxuanzheng/workbuddy
 
 ### 3.6 改时间 / 配通知
 
-- **改签到时间**：编辑 `.github/workflows/checkin.yml` 的 `cron`（**UTC**）。北京 09:00 = `'0 1 * * *'`。
+- **改签到时间**：编辑 `.github/workflows/checkin.yml` 的 `cron`（**UTC**）。北京 08:17 = `'17 0 * * *'`（用非整点避开排队）。
 - **失败通知**（可选，Secrets 里添加任意一个即生效；默认仅失败提醒）：
 
 | Secret | 用途 |
@@ -254,7 +254,7 @@ python3 scripts/set_accounts_secret.py accounts.json --repo lxuanzheng/workbuddy
 | 桌面客户端掉线 | 短信登录作废旧会话 | 客户端重新登录一次 |
 | 404 / 域名错误 | `domain` 填错 | 删掉该字段用默认，或填 `www.codebuddy.cn` |
 | Actions 一直不自动跑 | fork 默认可能禁用 scheduled workflow | Actions 页确认已启用；也可先手动 Run 一次 |
-| 定时没在 09:00 准点 | GitHub 排队延迟 | 正常，数十分钟内都算预期 |
+| 定时没在 08:17 准点 | GitHub Actions 排队延迟 | 免费版延迟不可控，实测曾达 6 小时；接口幂等，晚跑不会重复领 |
 
 本机排查辅助：
 
