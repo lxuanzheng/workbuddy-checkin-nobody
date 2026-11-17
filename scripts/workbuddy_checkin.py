@@ -653,9 +653,7 @@ def notify_system(res):
             body = "签到失败：" + str(res.get("msg", ""))
         else:
             body = str(res.get("msg", "签到完成"))
-            bal = res.get("balance")
-            if bal is not None:
-                body += " ｜ 当前积分余额：" + str(bal)
+            # msg 已自带积分文案，不再重复拼接
         _system_toast(title, body)
     except Exception:
         pass  # 通知失败绝不影响签到
@@ -736,7 +734,7 @@ def run(check_only):
                     today_signed = True
 
             if check_only:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                bal_txt = ("，累计签到积分 %s" % result["balance"]) if result.get("balance") is not None else ""
                 result.update(
                     status="ok",
                     action="skip_check_only",
@@ -746,7 +744,7 @@ def run(check_only):
                 return result
 
             if today_signed:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                bal_txt = ("，累计签到积分 %s" % result["balance"]) if result.get("balance") is not None else ""
                 result.update(status="ok", action="skip_already_signed",
                               msg="今日已签到，无需重复领取" + bal_txt)
                 return result
@@ -776,7 +774,7 @@ def run(check_only):
                     if bbal is not None:
                         result["balance"] = bbal
                         result["detail"]["balance"] = bbal
-                    bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                    bal_txt = ("，累计签到积分 %s" % result["balance"]) if result.get("balance") is not None else ""
                     result.update(status="ok", action="clicked",
                                   points=credit,
                                   msg="领取成功" + (("，+%s 积分" % credit) if credit else "") +
